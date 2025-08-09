@@ -1,46 +1,47 @@
-import os
-import re
-import faiss
-import pickle
-import numpy as np
+# scripts/embed_chunks.py
+import os, json, numpy as np, faiss
 from dotenv import load_dotenv
 import google.generativeai as genai
 
 load_dotenv()
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-embedding_model = genai.embed_content
 
-def load_text(file_path):
-    with open(file_path, "r", encoding="utf-8") as f:
-        return f.read()
+IN_JSONL = "data/chunks.jsonl"
+IDX_PATH = "embeddings/vector.index"
+META_JSONL = "embeddings/meta.jsonl"
 
-def split_text(text, chunk_size=500):
-    text = re.sub(r'\s+', ' ', text)
-    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+os.makedirs("embeddings", exist_ok=True)
 
-def embed_chunks(text_chunks):
-    embeddings = []
-    for chunk in text_chunks:
-        result = embedding_model(
+records = [json.loads(l) for l in open(IN_JSONL, encoding="utf-8")]
+texts = [r["text"] for r in records]
+
+def embed_many(strs, batch=32):
+    vecs = []
+    for i in range(0, len(strs), batch):
+        batch_text = strs[i:i+batch]
+        res = genai.embed_content(
             model="models/embedding-001",
-            content=chunk,
-            task_type="retrieval_document"
+            content=batch_text,
+            task_type="retrieval_document",
         )
-        vector = np.array(result["embedding"], dtype="float32")
-        embeddings.append(vector)
-    return embeddings
+        # Gemini returns a dict per item; normalize to NxD
+        if isinstance(res, dict) and "embedding" in res:
+            vecs.append(np.asarray(res["embedding"], dtype="float32"))
+        else:
+            # new API returns {"data":[{"embedding":[...]}]}
+            data = res.get("data", [])
+            vecs.extend([np.asarray(d["embedding"], dtype="float32") for d in data])
+    return np.vstack(vecs)
 
-def save_embeddings(chunks):
-    vectors = embed_chunks(chunks)
-    index = faiss.IndexFlatL2(len(vectors[0]))
-    index.add(np.array(vectors))
-    faiss.write_index(index, "embeddings/vector.index")
+emb = embed_many(texts)
+d = emb.shape[1]
+index = faiss.IndexFlatIP(d)
+# normalize vectors for IP similarity
+faiss.normalize_L2(emb)
+index.add(emb)
+faiss.write_index(index, IDX_PATH)
 
-    with open("data/texts.pkl", "wb") as f:
-        pickle.dump(chunks, f)
-
-if __name__ == "__main__":
-    raw_text = load_text("data/chunks.txt")
-    chunks = split_text(raw_text)
-    save_embeddings(chunks)
-    print(f"Saved {len(chunks)} chunks to FAISS index.")
+# save metadata aligned by row
+with open(META_JSONL, "w", encoding="utf-8") as f:
+    for r in records:
+        f.write(json.dumps(r, ensure_ascii=False) + "\n")

@@ -1,33 +1,65 @@
-# scrape_site.py
+import os, re, json, time, urllib.parse
 import requests
 from bs4 import BeautifulSoup
-import os
+from collections import deque
 
-base_url = "https://iotmanufacturingtech.com"
-visited = set()
-output_dir = "site_content"
-os.makedirs(output_dir, exist_ok=True)
+BASE = "https://iotmanufacturingtech.com"
+OUT_JSONL = "data/site_content/pages.jsonl"
+SEEN, QUEUE = set([BASE]), deque([BASE])
 
-def scrape(url):
-    if url in visited or not url.startswith(base_url):
-        return
-    visited.add(url)
-    print("Scraping:", url)
+def same_domain(url):
+    return urllib.parse.urlparse(url).netloc.endswith("iotmanufacturingtech.com")
 
-    try:
-        res = requests.get(url)
-        soup = BeautifulSoup(res.text, "html.parser")
-        text = soup.get_text()
-        file_name = os.path.join(output_dir, url.replace(base_url, "").strip("/").replace("/", "_") + ".txt")
-        with open(file_name, "w", encoding="utf-8") as f:
-            f.write(text)
+def canonicalize(url):
+    u = urllib.parse.urlsplit(url)
+    u = u._replace(fragment="", query="")  # drop # and ?params
+    return urllib.parse.urlunsplit(u)
 
-        for a_tag in soup.find_all("a", href=True):
-            next_url = a_tag["href"]
-            if next_url.startswith("/"):
-                next_url = base_url + next_url
-            scrape(next_url)
-    except Exception as e:
-        print("Error scraping:", url, e)
+def extract(url):
+    r = requests.get(url, timeout=20, headers={"User-Agent":"KB-bot/1.0"})
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
 
-scrape(base_url)
+    # canonical URL if present
+    can = soup.find("link", rel="canonical")
+    canon = canonicalize(can["href"]) if can and can.get("href") else url
+
+    # remove nav/footers/aside/scripts
+    for sel in ["nav","footer","aside","script","style","noscript","form"]:
+        for t in soup.select(sel):
+            t.decompose()
+
+    title = (soup.title.string or "").strip() if soup.title else ""
+    # get main content text
+    body = soup.get_text(separator="\n")
+    # collapse whitespace
+    body = re.sub(r"\n{2,}", "\n\n", body).strip()
+
+    return {"url": canon, "title": title, "text": body}
+
+def enqueue_links(soup, base_url):
+    for a in soup.find_all("a", href=True):
+        href = urllib.parse.urljoin(base_url, a["href"])
+        href = canonicalize(href)
+        if same_domain(href) and href not in SEEN:
+            SEEN.add(href)
+            QUEUE.append(href)
+
+def crawl():
+    os.makedirs(os.path.dirname(OUT_JSONL), exist_ok=True)
+    with open(OUT_JSONL, "w", encoding="utf-8") as f:
+        while QUEUE:
+            url = QUEUE.popleft()
+            try:
+                r = requests.get(url, timeout=20, headers={"User-Agent":"KB-bot/1.0"})
+                r.raise_for_status()
+                soup = BeautifulSoup(r.text, "html.parser")
+                page = extract(url)
+                f.write(json.dumps(page, ensure_ascii=False) + "\n")
+                enqueue_links(soup, url)
+                time.sleep(0.5)
+            except Exception as e:
+                print("skip", url, e)
+
+if __name__ == "__main__":
+    crawl()
